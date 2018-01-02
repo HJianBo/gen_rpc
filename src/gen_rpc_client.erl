@@ -245,6 +245,7 @@ init({Node}) ->
                 {ok, Socket} ->
                     case DriverMod:authenticate_server(Socket) of
                         ok ->
+                            reconnect_args_set(Node, Port),
                             {ok, #state{socket=Socket,
                                         driver=Driver,
                                         driver_mod=DriverMod,
@@ -271,7 +272,9 @@ handle_call({{call,_M,_F,_A} = PacketTuple, SendTO}, Caller, #state{socket=Socke
         {error, Reason} ->
             ?log(error, "message=call event=transmission_failed driver=~s socket=\"~s\" caller=\"~p\" reason=\"~p\"",
                  [Driver, gen_rpc_helper:socket_to_string(Socket), Caller, Reason]),
-            {stop, Reason, Reason, State};
+            %% {stop, Reason, Reason, State};
+            %% Atemp to redeliver once, if need
+            redeliver_if_need(Reason, {PacketTuple, Caller}, State);
         ok ->
             ?log(debug, "message=call event=transmission_succeeded driver=~s socket=\"~s\" caller=\"~p\"",
                  [Driver, gen_rpc_helper:socket_to_string(Socket), Caller]),
@@ -308,7 +311,9 @@ handle_cast({{async_call,_M,_F,_A} = PacketTuple, Caller, Ref}, #state{socket=So
         {error, Reason} ->
             ?log(error, "message=async_call event=transmission_failed driver=~s socket=\"~s\" worker_pid=\"~p\" call_ref=\"~p\" reason=\"~p\"",
                  [Driver, gen_rpc_helper:socket_to_string(Socket), Caller, Ref, Reason]),
-            {stop, Reason, Reason, State};
+            %% {stop, Reason, Reason, State};
+            %% Atemp to redeliver once, if need
+            redeliver_if_need(Reason, {PacketTuple, {Caller,Ref}}, State);
         ok ->
             ?log(debug, "message=async_call event=transmission_succeeded driver=~s socket=\"~s\" worker_pid=\"~p\" call_ref=\"~p\"",
                  [Driver, gen_rpc_helper:socket_to_string(Socket), Caller, Ref]),
@@ -386,7 +391,9 @@ send_cast(PacketTuple, #state{socket=Socket, driver=Driver, driver_mod=DriverMod
         {error, Reason} ->
             ?log(error, "message=cast event=transmission_failed driver=~s socket=\"~s\" reason=\"~p\"",
                  [Driver, gen_rpc_helper:socket_to_string(Socket), Reason]),
-            {stop, Reason, State};
+            %% {stop, Reason, State};
+            %% Atemp to redeliver once, if need
+            redeliver_if_need(Reason, PacketTuple, State, SendTO, Activate);
         ok ->
             ok = if Activate =:= true -> DriverMod:activate_socket(Socket);
                true -> ok
@@ -496,3 +503,61 @@ parse_sbcast_results([{_Pid,Node}|WorkerPids], Ref, {Good, Bad}, Timeout) ->
 
 parse_sbcast_results([], _Ref, Results, _Timeout) ->
     Results.
+
+%% @doc reconnect to remote node, and send rpc again
+redeliver_if_need(Reason, PacketTuple, State) ->
+    redeliver_if_need(Reason, PacketTuple, State, undefined, true).
+
+redeliver_if_need({badtcp, econnreset}, PacketTuple,
+                   #state{driver_mod=DriverMod, socket=OldSocket, driver=Driver} = State,
+                   SendTO, Activate) ->
+    {Node, Port} = reconnect_args_get(),
+    ?log(info, "event=reconnect_and_redeliver remote=~p:~p packet=~p",
+         [Node, Port, PacketTuple]),
+    case DriverMod:connect(Node, Port) of
+        {ok, Socket} ->
+            case DriverMod:authenticate_server(Socket) of
+                ok ->
+                    gen_tcp:close(OldSocket),
+                    case redeliver(DriverMod, Socket, PacketTuple, SendTO, Activate) of
+                        {error, Reason} ->
+                            ?log(error, "message=redeliver event=transmission_failed driver=~s socket=\"~s\" reason=\"~p\"",
+                                 [Driver, gen_rpc_helper:socket_to_string(Socket), Reason]),
+                            {stop, {redeliver, Reason}, State#state{socket=Socket}};
+                        ok ->
+                            ?log(info, "message=redeliver event=transmission_succeeded driver=~s socket=\"~s\"",
+                                 [Driver, gen_rpc_helper:socket_to_string(Socket)]),
+                            {noreply, State#state{socket=Socket}, gen_rpc_helper:get_inactivity_timeout(?MODULE)}
+                    end;
+                {error, ReasonTuple} ->
+                    ?log(error, "event=client_authentication_failed driver=~s reason=\"~p\"", [Driver, ReasonTuple]),
+                    {stop, {reconnect, ReasonTuple}}
+            end;
+        {error, {_Class,Reason}} ->
+            %% This should be badtcp but to conform with
+            %% the RPC library we return badrpc
+            {stop, {badrpc, {reconnect, Reason}}, State}
+    end;
+
+%% Others error reason don't redeliver
+redeliver_if_need(Reason, _PacketTuple, State, _SendTO, _Activate) ->
+    {stop, Reason, State}.
+
+redeliver(DriverMod, Socket, PacketTuple, SendTO, Activate) ->
+    Packet = erlang:term_to_binary(PacketTuple),
+    ok = DriverMod:set_send_timeout(Socket, SendTO),
+    case DriverMod:send(Socket, Packet) of
+        {error, Reason} -> {error, Reason};
+        ok ->
+            ok = if Activate =:= true -> DriverMod:activate_socket(Socket);
+               true -> ok
+            end, ok
+    end.
+
+reconnect_args_set(Node, Port) ->
+    put(node, Node),
+    put(port, Port).
+
+reconnect_args_get() ->
+    {get(node), get(port)}.
+
